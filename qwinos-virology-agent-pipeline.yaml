@@ -1,0 +1,303 @@
+# ============================================================
+# qwinOS™ PaperCLIP ML — Virology Agent CI/CD Pipeline (Java + MLflow + AKS)
+# Author: Michael Logic™ Davis
+# Purpose: KPI-driven lifecycle for a Beta Virology Agent (Java-first)
+# Note: Enforces safety gates; artifact provenance & MLflow tracking.
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/virology-*
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # ----- agent & repo -----
+  AGENT_NAME: "virology-agent"
+  AGENT_PATH: "agents/virology-agent"
+  KPI_CONTRACT: "specs/kpi/virology_kpi.yaml"
+
+  # ----- Java / Maven -----
+  MAVEN_CMD: "mvn"
+  MAVEN_OPTS: "-DskipTests=false -B"
+  MAVEN_BUILD_PROFILE: "release"
+
+  # ----- MLflow -----
+  MLFLOW_TRACKING_URI: "http://mlflow-service.mlflow.svc.cluster.local:5000"
+  MLFLOW_EXPERIMENT: "$(AGENT_NAME)-exp"
+  MLFLOW_REGISTRY: "mlflow-registry"
+
+  # ----- Azure / AKS -----
+  AZURE_SUBSCRIPTION_ID: "$(azureServiceConnectionId)"
+  RESOURCE_GROUP: "qwinos-rg"
+  AKS_CLUSTER_NAME: "qwinos-aks"
+  KUBE_NAMESPACE: "qwinos-staging"
+
+  # ----- artifacts & metadata -----
+  BUILD_ARTIFACT_NAME: "$(AGENT_NAME)-artifacts"
+  PROVENANCE_TAGS: "owner=MichaelLogic,domain=virology,status=beta,commit=$(Build.SourceVersion)"
+
+stages:
+
+# -------------------------
+# STAGE 1 — Build
+# -------------------------
+- stage: Build
+  displayName: "Build (Maven) — reproducible Java artifact"
+  jobs:
+    - job: MavenBuild
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - task: Maven@3
+          displayName: "Maven: Clean & Package"
+          inputs:
+            mavenPomFile: '$(AGENT_PATH)/pom.xml'
+            goals: 'clean package'
+            options: '$(MAVEN_OPTS) -P$(MAVEN_BUILD_PROFILE)'
+
+        - script: |
+            echo ">>> [Provenance] Capturing build metadata"
+            echo "commit=$(Build.SourceVersion)" > build/provenance.properties
+            echo "branch=$(Build.SourceBranch)" >> build/provenance.properties
+            echo "buildId=$(Build.BuildId)" >> build/provenance.properties
+            echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> build/provenance.properties
+          displayName: "Write provenance metadata"
+
+        - publish: $(Agent.BuildDirectory)/$(AGENT_PATH)/target
+          artifact: "$(BUILD_ARTIFACT_NAME)"
+
+# -------------------------
+# STAGE 2 — Unit Tests & Static Analysis
+# -------------------------
+- stage: Test
+  displayName: "Unit Tests & Static Analysis"
+  dependsOn: Build
+  jobs:
+    - job: UnitTests
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - script: |
+            echo ">>> [Test] Running Maven unit tests"
+            cd $(AGENT_PATH)
+            $(MAVEN_CMD) test -B
+          displayName: "Run unit tests"
+
+        - task: PublishTestResults@2
+          displayName: "Publish JUnit Test Results"
+          inputs:
+            testResultsFiles: '**/target/surefire-reports/TEST-*.xml'
+            testRunTitle: "Virology Agent Unit Tests"
+
+        - script: |
+            echo ">>> [QA] Run static analysis (spotbugs/checkstyle) - keep build quality high"
+            cd $(AGENT_PATH)
+            $(MAVEN_CMD) -DskipTests=true spotbugs:check || true
+          displayName: "Static analysis (non-blocking)"
+
+# -------------------------
+# STAGE 3 — Train (Java) -> MLflow
+# -------------------------
+- stage: Train
+  displayName: "Train (Java) & Log to MLflow"
+  dependsOn: Test
+  jobs:
+    - job: TrainJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - script: |
+            echo ">>> [Train] Start Java training (MLflow tracking: $(MLFLOW_TRACKING_URI))"
+            # Run the TrainAgent Java entrypoint. It MUST accept parameters:
+            #  --kpi_contract, --mlflow_tracking_uri, --experiment, --output_dir
+            JAR="$(Agent.BuildDirectory)/$(AGENT_PATH)/target/$(AGENT_NAME)-assembly.jar"
+            java -Xmx4g -jar "$JAR" \
+              com.qwinos.virology.TrainAgent \
+              --kpi_contract "$(KPI_CONTRACT)" \
+              --mlflow_tracking_uri "$(MLFLOW_TRACKING_URI)" \
+              --experiment "$(MLFLOW_EXPERIMENT)" \
+              --output_dir "$(Pipeline.Workspace)/run_outputs" \
+              --provenance_tags "$(PROVENANCE_TAGS)"
+          displayName: "Run Java TrainAgent (logs metrics to MLflow)"
+
+        - script: |
+            echo ">>> [Store] Normalize artifacts and copy to pipeline workspace"
+            mkdir -p $(Build.ArtifactStagingDirectory)/$(AGENT_NAME)
+            cp -r $(Pipeline.Workspace)/run_outputs/* $(Build.ArtifactStagingDirectory)/$(AGENT_NAME)/
+          displayName: "Stage training outputs"
+
+        - publish: $(Build.ArtifactStagingDirectory)
+          artifact: "$(BUILD_ARTIFACT_NAME)"
+
+# -------------------------
+# STAGE 4 — Evaluate (Java) & KPI Contract Enforcement
+# -------------------------
+- stage: Evaluate
+  displayName: "Evaluate & Enforce KPI Contract"
+  dependsOn: Train
+  jobs:
+    - job: EvaluateJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - download: current
+          artifact: "$(BUILD_ARTIFACT_NAME)"
+
+        - script: |
+            echo ">>> [Evaluate] Running Java evaluation; must enforce KPI thresholds"
+            JAR="$(Agent.BuildDirectory)/$(AGENT_PATH)/target/$(AGENT_NAME)-assembly.jar"
+            java -Xmx2g -jar "$JAR" \
+              com.qwinos.virology.EvaluateAgent \
+              --kpi_contract "$(KPI_CONTRACT)" \
+              --mlflow_tracking_uri "$(MLFLOW_TRACKING_URI)" \
+              --experiment "$(MLFLOW_EXPERIMENT)" \
+              --run_artifact_dir "$(Pipeline.Workspace)/run_outputs" \
+              --report_file "$(Pipeline.Workspace)/eval_report.json"
+          displayName: "Run Java EvaluateAgent (computes KPIs)"
+
+        - script: |
+            echo ">>> [Gate] Apply KPI gates (fail pipeline on hard failures)"
+            python3 - <<'PY'
+import json,sys
+rpath="$(Pipeline.Workspace)/eval_report.json"
+try:
+    with open(rpath,'r') as f:
+        rep=json.load(f)
+except Exception as e:
+    print("Could not read eval_report.json:",e); sys.exit(1)
+
+# expected schema: {"kpis":[{"id":"...","value":..., "pass": true/false, "reason": "..."}], "safety_flags":[...]}
+failed=[k for k in rep.get("kpis",[]) if not k.get("pass",False)]
+if failed:
+    print("KPI FAILURES DETECTED:")
+    for f in failed:
+        print(f)
+    sys.exit(2)
+print("All KPI gates passed.")
+PY
+          displayName: "Evaluate KPI gate (fail on KPI violation)"
+
+        - publish: $(Pipeline.Workspace)/eval_report.json
+          artifact: "eval-report"
+
+# -------------------------
+# STAGE 5 — Register Model (MLflow Registry via Java)
+# -------------------------
+- stage: Register
+  displayName: "Register Model (MLflow Registry) + Approval Gate for Safety"
+  dependsOn: Evaluate
+  condition: succeeded()
+  jobs:
+
+    - job: RegisterJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - script: |
+            echo ">>> [Register] Registering model in MLflow registry via Java helper"
+            JAR="$(Agent.BuildDirectory)/$(AGENT_PATH)/target/$(AGENT_NAME)-assembly.jar"
+            java -Xmx1g -jar "$JAR" \
+              com.qwinos.virology.RegisterAgent \
+              --mlflow_tracking_uri "$(MLFLOW_TRACKING_URI)" \
+              --experiment "$(MLFLOW_EXPERIMENT)" \
+              --model_artifact_path "runs:/$(Build.BuildId)/model" \
+              --registered_name "$(AGENT_NAME)" \
+              --tags "$(PROVENANCE_TAGS)"
+          displayName: "Register model to MLflow Registry"
+
+        - task: ManualValidation@0
+          displayName: "Manual Approval (Safety Review Board)"
+          inputs:
+            notifyUsers: '<safety-review-group@qwinos.inc>'
+            instructions: |
+              This model is for VIROLOGY domain (Beta). Do NOT approve production without explicit safety sign-off.
+              Review: eval-report, model card, provenance. Approve to proceed to staging deployment.
+            onTimeout: 'reject'
+            timeout: '4320' # 3 days
+
+# -------------------------
+# STAGE 6 — Deploy to Staging AKS
+# -------------------------
+- stage: Deploy
+  displayName: "Deploy to Staging AKS (Blue/Green-capable)"
+  dependsOn: Register
+  condition: succeeded()
+  jobs:
+    - deployment: DeployStaging
+      displayName: "Deploy Virology Agent to AKS (staging)"
+      environment: 'staging'
+      pool:
+        vmImage: 'ubuntu-latest'
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureCLI@2
+                displayName: "Azure: Get AKS credentials"
+                inputs:
+                  azureSubscription: '$(azureServiceConnectionId)'
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az account set --subscription $(azureServiceConnectionId)
+                    az aks get-credentials --resource-group $(RESOURCE_GROUP) --name $(AKS_CLUSTER_NAME) --admin --overwrite-existing
+                    kubectl config use-context $(AKS_CLUSTER_NAME)
+
+              - script: |
+                  echo ">>> [Deploy] Apply k8s manifests (deployment + svc + hpa) for $(AGENT_NAME)"
+                  kubectl apply -n $(KUBE_NAMESPACE) -f infra/deploy/virology-staging.yaml
+                  kubectl rollout status deployment/virology-agent -n $(KUBE_NAMESPACE) --timeout=180s
+                displayName: "kubectl apply - staging manifests"
+
+              - script: |
+                  echo ">>> [Smoke] Run smoke-checks against staging endpoint"
+                  # the agent provides a health endpoint and a smoke inference endpoint
+                  kubectl -n $(KUBE_NAMESPACE) port-forward svc/virology-agent 8085:8085 >/dev/null 2>&1 &
+                  sleep 3
+                  curl --fail http://qwinos.io:8085/health || exit 10
+                  curl --fail -X POST http://qwinos.io/infer -H 'Content-Type: application/json' -d '{"prompt":"safety_test"}' || exit 11
+                displayName: "Smoke tests (health & basic infer)"
+
+# -------------------------
+# STAGE 7 — Monitor (KPI Watchdog)
+# -------------------------
+- stage: Monitor
+  displayName: "Monitor KPIs & Safety Telemetry (24h watch)"
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+    - job: MonitorJob
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - script: |
+            echo ">>> [Monitor] Launching Java MonitorAgent to sample MLflow & telemetry"
+            JAR="$(Agent.BuildDirectory)/$(AGENT_PATH)/target/$(AGENT_NAME)-assembly.jar"
+            java -Xmx1g -jar "$JAR" \
+              com.qwinos.virology.MonitorAgent \
+              --mlflow_tracking_uri "$(MLFLOW_TRACKING_URI)" \
+              --experiment "$(MLFLOW_EXPERIMENT)" \
+              --kpi_contract "$(KPI_CONTRACT)" \
+              --window "24h" \
+              --alert_webhook "https://ops.qwinos.inc/hooks/alert"
+          displayName: "Run Java MonitorAgent (KPI sampling + alert)"
+
+        - script: |
+            echo ">>> [Notify] Publish evaluation & monitoring artifacts"
+            mkdir -p $(Build.ArtifactStagingDirectory)/monitor
+            # assume MonitorAgent writes monitor_report.json to workspace
+            cp $(Pipeline.Workspace)/monitor_report.json $(Build.ArtifactStagingDirectory)/monitor/ || true
+          displayName: "Stage monitor artifacts"
+
+        - publish: $(Build.ArtifactStagingDirectory)/monitor
+          artifact: "monitor-report"
+
+# ============================================================
+
+
